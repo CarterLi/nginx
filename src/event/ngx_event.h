@@ -151,16 +151,16 @@ struct ngx_event_aio_s {
     ssize_t                  (*preload_handler)(ngx_buf_t *file);
 #endif
 
-#if (NGX_HAVE_EVENTFD)
     int64_t                    res;
-#endif
 
-#if !(NGX_HAVE_EVENTFD) || (NGX_TEST_BUILD_EPOLL)
+#if NGX_TEST_BUILD_EPOLL
     ngx_err_t                  err;
     size_t                     nbytes;
 #endif
 
-    ngx_aiocb_t                aiocb;
+    /* Make sure that this iov has the same lifecycle with its associated aio event */
+    struct iovec               iov;
+
     ngx_event_t                event;
 };
 
