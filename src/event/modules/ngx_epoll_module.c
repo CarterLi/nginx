@@ -78,15 +78,20 @@ ngx_module_t  ngx_epoll_module = {
 };
 
 
-struct io_uring_sqe *ngx_get_sqe_safe(struct io_uring *ring, ngx_log_t *log) {
+struct io_uring_sqe *
+ngx_get_sqe_safe(struct io_uring *ring, ngx_log_t *log) {
     struct io_uring_sqe *ret = io_uring_get_sqe(&ngx_ring);
     if (!ret) {
-        io_uring_submit(&ngx_ring);
+        if (io_uring_submit(&ngx_ring) < 0) {
+            ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
+                          "ngx_get_sqe_safe() failed");
+            return NULL;
+        }
         ret = io_uring_get_sqe(ring);
     }
     if (!ret) {
         ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
-                        "ngx_get_sqe_safe() failed");
+                      "ngx_get_sqe_safe() failed");
         return NULL;
     }
     return ret;
@@ -315,7 +320,7 @@ static ngx_int_t
 ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
 {
     uint32_t           revents;
-    ngx_int_t          instance;
+
     ngx_uint_t         level;
     ngx_err_t          err;
     ngx_event_t       *rev, *wev;
@@ -387,7 +392,7 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
             ngx_post_event(e, &ngx_posted_events);
         } else {
             ngx_connection_t *c = io_uring_cqe_get_data(cqe);
-            instance = (uintptr_t) c & 1;
+            ngx_int_t instance = (uintptr_t) c & 1;
             c = (ngx_connection_t *) ((uintptr_t) c & (uintptr_t) ~1);
 
             rev = c->read;
