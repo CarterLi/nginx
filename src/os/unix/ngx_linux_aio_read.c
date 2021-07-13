@@ -16,7 +16,7 @@ extern struct io_uring          ngx_ring;
 
 
 static void ngx_file_aio_event_handler(ngx_event_t *ev);
-
+struct io_uring_sqe *ngx_get_sqe_safe(struct io_uring *ring, ngx_log_t *log);
 
 ngx_int_t
 ngx_file_aio_init(ngx_file_t *file, ngx_pool_t *pool)
@@ -87,7 +87,7 @@ ngx_file_aio_read(ngx_file_t *file, u_char *buf, size_t size, off_t offset,
         return NGX_ERROR;
     }
 
-    sqe = io_uring_get_sqe(&ngx_ring);
+    sqe = ngx_get_sqe_safe(&ngx_ring, file->log);
 
     if (!sqe) {
         ngx_log_debug4(NGX_LOG_DEBUG_CORE, file->log, 0,
