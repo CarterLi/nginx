@@ -47,11 +47,7 @@
 #define NGX_MODULE_SIGNATURE_4   "0"
 #endif
 
-#if (NGX_HAVE_EVENTFD)
-#define NGX_MODULE_SIGNATURE_5   "1"
-#else
 #define NGX_MODULE_SIGNATURE_5   "0"
-#endif
 
 #if (NGX_HAVE_EPOLL)
 #define NGX_MODULE_SIGNATURE_6   "1"

@@ -9,19 +9,13 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 
+#include <liburing.h>
 
-extern int            ngx_eventfd;
-extern aio_context_t  ngx_aio_ctx;
+
+extern struct io_uring          ngx_ring;
 
 
 static void ngx_file_aio_event_handler(ngx_event_t *ev);
-
-
-static int
-io_submit(aio_context_t ctx, long n, struct iocb **paiocb)
-{
-    return syscall(SYS_io_submit, ctx, n, paiocb);
-}
 
 
 ngx_int_t
@@ -50,10 +44,10 @@ ssize_t
 ngx_file_aio_read(ngx_file_t *file, u_char *buf, size_t size, off_t offset,
     ngx_pool_t *pool)
 {
-    ngx_err_t         err;
-    struct iocb      *piocb[1];
-    ngx_event_t      *ev;
-    ngx_event_aio_t  *aio;
+    ngx_err_t             err;
+    ngx_event_t          *ev;
+    ngx_event_aio_t      *aio;
+    struct io_uring_sqe  *sqe;
 
     if (!ngx_file_aio) {
         return ngx_read_file(file, buf, size, offset);
@@ -93,22 +87,41 @@ ngx_file_aio_read(ngx_file_t *file, u_char *buf, size_t size, off_t offset,
         return NGX_ERROR;
     }
 
-    ngx_memzero(&aio->aiocb, sizeof(struct iocb));
+    sqe = io_uring_get_sqe(&ngx_ring);
 
-    aio->aiocb.aio_data = (uint64_t) (uintptr_t) ev;
-    aio->aiocb.aio_lio_opcode = IOCB_CMD_PREAD;
-    aio->aiocb.aio_fildes = file->fd;
-    aio->aiocb.aio_buf = (uint64_t) (uintptr_t) buf;
-    aio->aiocb.aio_nbytes = size;
-    aio->aiocb.aio_offset = offset;
-    aio->aiocb.aio_flags = IOCB_FLAG_RESFD;
-    aio->aiocb.aio_resfd = ngx_eventfd;
+    if (!sqe) {
+        ngx_log_debug4(NGX_LOG_DEBUG_CORE, file->log, 0,
+                       "aio no sqe left:%d @%O:%uz %V",
+                       ev->complete, offset, size, &file->name);
+        return ngx_read_file(file, buf, size, offset);
+    }
+
+    if (__builtin_expect(!!(ngx_ring.features & IORING_FEAT_CUR_PERSONALITY), 1)) {
+        /*
+         * `io_uring_prep_read` is faster than `io_uring_prep_readv`, because the kernel
+         * doesn't need to import iovecs in advance.
+         *
+         * If the kernel supports `IORING_FEAT_CUR_PERSONALITY`, it should support
+         * non-vectored read/write commands too.
+         *
+         * It's not perfect, but avoids an extra feature-test syscall.
+         */
+        io_uring_prep_read(sqe, file->fd, buf, size, offset);
+    } else {
+        /*
+         * We must store iov into heap to prevent kernel from returning -EFAULT
+         * in case `IORING_FEAT_SUBMIT_STABLE` is not supported
+         */
+        aio->iov.iov_base = buf;
+        aio->iov.iov_len = size;
+        io_uring_prep_readv(sqe, file->fd, &aio->iov, 1, offset);
+    }
+    io_uring_sqe_set_data(sqe, ev);
+
 
     ev->handler = ngx_file_aio_event_handler;
 
-    piocb[0] = &aio->aiocb;
-
-    if (io_submit(ngx_aio_ctx, 1, piocb) == 1) {
+    if (io_uring_submit(&ngx_ring) == 1) {
         ev->active = 1;
         ev->ready = 0;
         ev->complete = 0;
