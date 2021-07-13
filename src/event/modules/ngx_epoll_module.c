@@ -13,7 +13,6 @@
 
 
 typedef struct {
-    ngx_uint_t  aio_requests;
 } ngx_epoll_conf_t;
 
 
@@ -50,13 +49,6 @@ ngx_uint_t                  ngx_use_epoll_rdhup = EPOLLRDHUP;
 static ngx_str_t      epoll_name = ngx_string("epoll");
 
 static ngx_command_t  ngx_epoll_commands[] = {
-
-    { ngx_string("worker_aio_requests"),
-      NGX_EVENT_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_num_slot,
-      0,
-      offsetof(ngx_epoll_conf_t, aio_requests),
-      NULL },
 
       ngx_null_command
 };
@@ -626,8 +618,6 @@ ngx_epoll_create_conf(ngx_cycle_t *cycle)
         return NULL;
     }
 
-    epcf->aio_requests = NGX_CONF_UNSET;
-
     return epcf;
 }
 
@@ -635,9 +625,5 @@ ngx_epoll_create_conf(ngx_cycle_t *cycle)
 static char *
 ngx_epoll_init_conf(ngx_cycle_t *cycle, void *conf)
 {
-    ngx_epoll_conf_t *epcf = conf;
-
-    ngx_conf_init_uint_value(epcf->aio_requests, 32);
-
     return NGX_CONF_OK;
 }
