@@ -9,85 +9,15 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 
-#if (NGX_HAVE_FILE_AIO)
 #include <liburing.h>
-#endif
-
-
-#if (NGX_TEST_BUILD_EPOLL)
-
-/* epoll declarations */
-
-#define EPOLLIN        0x001
-#define EPOLLPRI       0x002
-#define EPOLLOUT       0x004
-#define EPOLLERR       0x008
-#define EPOLLHUP       0x010
-#define EPOLLRDNORM    0x040
-#define EPOLLRDBAND    0x080
-#define EPOLLWRNORM    0x100
-#define EPOLLWRBAND    0x200
-#define EPOLLMSG       0x400
-
-#define EPOLLRDHUP     0x2000
-
-#define EPOLLEXCLUSIVE 0x10000000
-#define EPOLLONESHOT   0x40000000
-#define EPOLLET        0x80000000
-
-#define EPOLL_CTL_ADD  1
-#define EPOLL_CTL_DEL  2
-#define EPOLL_CTL_MOD  3
-
-typedef union epoll_data {
-    void         *ptr;
-    int           fd;
-    uint32_t      u32;
-    uint64_t      u64;
-} epoll_data_t;
-
-struct epoll_event {
-    uint32_t      events;
-    epoll_data_t  data;
-};
-
-
-int epoll_create(int size);
-
-int epoll_create(int size)
-{
-    return -1;
-}
-
-
-int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
-
-int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
-{
-    return -1;
-}
-
-
-int epoll_wait(int epfd, struct epoll_event *events, int nevents, int timeout);
-
-int epoll_wait(int epfd, struct epoll_event *events, int nevents, int timeout)
-{
-    return -1;
-}
-
-#endif /* NGX_TEST_BUILD_EPOLL */
 
 
 typedef struct {
-    ngx_uint_t  events;
     ngx_uint_t  aio_requests;
 } ngx_epoll_conf_t;
 
 
 static ngx_int_t ngx_epoll_init(ngx_cycle_t *cycle, ngx_msec_t timer);
-#if (NGX_HAVE_EPOLLRDHUP)
-static void ngx_epoll_test_rdhup(ngx_cycle_t *cycle);
-#endif
 static void ngx_epoll_done(ngx_cycle_t *cycle);
 static ngx_int_t ngx_epoll_add_event(ngx_event_t *ev, ngx_int_t event,
     ngx_uint_t flags);
@@ -106,9 +36,7 @@ static void ngx_epoll_io_uring_handler(ngx_event_t *ev);
 static void *ngx_epoll_create_conf(ngx_cycle_t *cycle);
 static char *ngx_epoll_init_conf(ngx_cycle_t *cycle, void *conf);
 
-static int                  ep = -1;
-static struct epoll_event  *event_list;
-static ngx_uint_t           nevents;
+static struct io_uring      ngx_ep_ring;
 
 #if (NGX_HAVE_FILE_AIO)
 struct io_uring             ngx_ring;
@@ -117,20 +45,11 @@ static ngx_event_t          ngx_ring_event;
 static ngx_connection_t     ngx_ring_conn;
 #endif
 
-#if (NGX_HAVE_EPOLLRDHUP)
-ngx_uint_t                  ngx_use_epoll_rdhup;
-#endif
+ngx_uint_t                  ngx_use_epoll_rdhup = EPOLLRDHUP;
 
 static ngx_str_t      epoll_name = ngx_string("epoll");
 
 static ngx_command_t  ngx_epoll_commands[] = {
-
-    { ngx_string("epoll_events"),
-      NGX_EVENT_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_num_slot,
-      0,
-      offsetof(ngx_epoll_conf_t, events),
-      NULL },
 
     { ngx_string("worker_aio_requests"),
       NGX_EVENT_CONF|NGX_CONF_TAKE1,
@@ -202,12 +121,17 @@ ngx_epoll_aio_init(ngx_cycle_t *cycle, ngx_epoll_conf_t *epcf)
     ee.events = EPOLLIN|EPOLLET;
     ee.data.ptr = &ngx_ring_conn;
 
-    if (epoll_ctl(ep, EPOLL_CTL_ADD, ngx_ring.ring_fd, &ee) != -1) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ngx_ep_ring);
+    io_uring_prep_poll_add(sqe, ngx_ring.ring_fd, ee.events);
+    sqe->len |= IORING_POLL_ADD_MULTI;
+    io_uring_sqe_set_data(sqe, ee.data.ptr);
+
+    if (io_uring_submit(&ngx_ep_ring) >= 0) {
         return;
     }
 
     ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
-                  "epoll_ctl(EPOLL_CTL_ADD, ring_fd) failed");
+                  "io_uring_submit(poll_add, ngx_ring.ring_fd) failed");
 
     io_uring_queue_exit(&ngx_ring);
 
@@ -227,37 +151,20 @@ ngx_epoll_init(ngx_cycle_t *cycle, ngx_msec_t timer)
 
     epcf = ngx_event_get_conf(cycle->conf_ctx, ngx_epoll_module);
 
-    if (ep == -1) {
-        ep = epoll_create(cycle->connection_n / 2);
+    if (ngx_ep_ring.ring_fd == 0) {
 
-        if (ep == -1) {
+        int ret = io_uring_queue_init(cycle->connection_n, &ngx_ep_ring, 0);
+
+        if (ret < 0) {
             ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
-                          "epoll_create() failed");
+                          "io_uring_queue_init() failed");
             return NGX_ERROR;
         }
 
 #if (NGX_HAVE_FILE_AIO)
         ngx_epoll_aio_init(cycle, epcf);
 #endif
-
-#if (NGX_HAVE_EPOLLRDHUP)
-        ngx_epoll_test_rdhup(cycle);
-#endif
     }
-
-    if (nevents < epcf->events) {
-        if (event_list) {
-            ngx_free(event_list);
-        }
-
-        event_list = ngx_alloc(sizeof(struct epoll_event) * epcf->events,
-                               cycle->log);
-        if (event_list == NULL) {
-            return NGX_ERROR;
-        }
-    }
-
-    nevents = epcf->events;
 
     ngx_io = ngx_os_io;
 
@@ -275,82 +182,11 @@ ngx_epoll_init(ngx_cycle_t *cycle, ngx_msec_t timer)
 }
 
 
-#if (NGX_HAVE_EPOLLRDHUP)
-
-static void
-ngx_epoll_test_rdhup(ngx_cycle_t *cycle)
-{
-    int                 s[2], events;
-    struct epoll_event  ee;
-
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, s) == -1) {
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "socketpair() failed");
-        return;
-    }
-
-    ee.events = EPOLLET|EPOLLIN|EPOLLRDHUP;
-
-    if (epoll_ctl(ep, EPOLL_CTL_ADD, s[0], &ee) == -1) {
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "epoll_ctl() failed");
-        goto failed;
-    }
-
-    if (close(s[1]) == -1) {
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "close() failed");
-        s[1] = -1;
-        goto failed;
-    }
-
-    s[1] = -1;
-
-    events = epoll_wait(ep, &ee, 1, 5000);
-
-    if (events == -1) {
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "epoll_wait() failed");
-        goto failed;
-    }
-
-    if (events) {
-        ngx_use_epoll_rdhup = ee.events & EPOLLRDHUP;
-
-    } else {
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, NGX_ETIMEDOUT,
-                      "epoll_wait() timed out");
-    }
-
-    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
-                   "testing the EPOLLRDHUP flag: %s",
-                   ngx_use_epoll_rdhup ? "success" : "fail");
-
-failed:
-
-    if (s[1] != -1 && close(s[1]) == -1) {
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "close() failed");
-    }
-
-    if (close(s[0]) == -1) {
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "close() failed");
-    }
-}
-
-#endif
-
-
 static void
 ngx_epoll_done(ngx_cycle_t *cycle)
 {
-    if (close(ep) == -1) {
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "epoll close() failed");
-    }
-
-    ep = -1;
+    io_uring_queue_exit(&ngx_ep_ring);
+    ngx_ep_ring.ring_fd = 0;
 
 #if (NGX_HAVE_FILE_AIO)
 
@@ -360,11 +196,6 @@ ngx_epoll_done(ngx_cycle_t *cycle)
     }
 
 #endif
-
-    ngx_free(event_list);
-
-    event_list = NULL;
-    nevents = 0;
 }
 
 
@@ -404,22 +235,28 @@ ngx_epoll_add_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
         op = EPOLL_CTL_ADD;
     }
 
-#if (NGX_HAVE_EPOLLEXCLUSIVE && NGX_HAVE_EPOLLRDHUP)
     if (flags & NGX_EXCLUSIVE_EVENT) {
         events &= ~EPOLLRDHUP;
     }
-#endif
-
     ee.events = events | (uint32_t) flags;
     ee.data.ptr = (void *) ((uintptr_t) c | ev->instance);
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ngx_ep_ring);
+    if (op == EPOLL_CTL_ADD) {
+        io_uring_prep_poll_add(sqe, c->fd, ee.events);
+        sqe->len |= IORING_POLL_ADD_MULTI;
+        io_uring_sqe_set_data(sqe, ee.data.ptr);
+    } else {
+        io_uring_prep_poll_update(sqe, ee.data.ptr, NULL, ee.events, IORING_POLL_UPDATE_EVENTS);
+    }
 
     ngx_log_debug3(NGX_LOG_DEBUG_EVENT, ev->log, 0,
                    "epoll add event: fd:%d op:%d ev:%08XD",
                    c->fd, op, ee.events);
 
-    if (epoll_ctl(ep, op, c->fd, &ee) == -1) {
+    if (io_uring_submit(&ngx_ep_ring) < 0) {
         ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_errno,
-                      "epoll_ctl(%d, %d) failed", op, c->fd);
+                      "io_uring_submit(poll_add) failed");
         return NGX_ERROR;
     }
 
@@ -471,16 +308,23 @@ ngx_epoll_del_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
     } else {
         op = EPOLL_CTL_DEL;
         ee.events = 0;
-        ee.data.ptr = NULL;
+        ee.data.ptr = (void *) ((uintptr_t) c | ev->instance);
+    }
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ngx_ep_ring);
+    if (op == EPOLL_CTL_MOD) {
+        io_uring_prep_poll_update(sqe, ee.data.ptr, NULL, ee.events, IORING_POLL_UPDATE_EVENTS);
+    } else {
+        io_uring_prep_poll_remove(sqe, ee.data.ptr);
     }
 
     ngx_log_debug3(NGX_LOG_DEBUG_EVENT, ev->log, 0,
                    "epoll del event: fd:%d op:%d ev:%08XD",
                    c->fd, op, ee.events);
 
-    if (epoll_ctl(ep, op, c->fd, &ee) == -1) {
+    if (io_uring_submit(&ngx_ep_ring) < 0) {
         ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_errno,
-                      "epoll_ctl(%d, %d) failed", op, c->fd);
+                      "io_uring_submit(poll_remove) failed");
         return NGX_ERROR;
     }
 
@@ -498,12 +342,17 @@ ngx_epoll_add_connection(ngx_connection_t *c)
     ee.events = EPOLLIN|EPOLLOUT|EPOLLET|EPOLLRDHUP;
     ee.data.ptr = (void *) ((uintptr_t) c | c->read->instance);
 
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ngx_ep_ring);
+    io_uring_prep_poll_add(sqe, c->fd, ee.events);
+    sqe->len |= IORING_POLL_ADD_MULTI;
+    io_uring_sqe_set_data(sqe, ee.data.ptr);
+
     ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
                    "epoll add connection: fd:%d ev:%08XD", c->fd, ee.events);
 
-    if (epoll_ctl(ep, EPOLL_CTL_ADD, c->fd, &ee) == -1) {
+    if (io_uring_submit(&ngx_ep_ring) < 0) {
         ngx_log_error(NGX_LOG_ALERT, c->log, ngx_errno,
-                      "epoll_ctl(EPOLL_CTL_ADD, %d) failed", c->fd);
+                      "io_uring_submit(poll_add) failed");
         return NGX_ERROR;
     }
 
@@ -535,11 +384,14 @@ ngx_epoll_del_connection(ngx_connection_t *c, ngx_uint_t flags)
                    "epoll del connection: fd:%d", c->fd);
 
     ee.events = 0;
-    ee.data.ptr = NULL;
+    ee.data.ptr = (void *) ((uintptr_t) c | c->read->instance);
 
-    if (epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, &ee) == -1) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ngx_ep_ring);
+    io_uring_prep_poll_remove(sqe, ee.data.ptr);
+
+    if (io_uring_submit(&ngx_ep_ring) < 0) {
         ngx_log_error(NGX_LOG_ALERT, c->log, ngx_errno,
-                      "epoll_ctl(EPOLL_CTL_DEL, %d) failed", c->fd);
+                      "io_uring_submit(poll_remove, %d) failed", c->fd);
         return NGX_ERROR;
     }
 
@@ -553,9 +405,8 @@ ngx_epoll_del_connection(ngx_connection_t *c, ngx_uint_t flags)
 static ngx_int_t
 ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
 {
-    int                events;
     uint32_t           revents;
-    ngx_int_t          instance, i;
+    ngx_int_t          instance;
     ngx_uint_t         level;
     ngx_err_t          err;
     ngx_event_t       *rev, *wev;
@@ -567,9 +418,19 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
                    "epoll timer: %M", timer);
 
-    events = epoll_wait(ep, event_list, (int) nevents, timer);
+    struct io_uring_cqe *cqe;
+    int ret = 0;
 
-    err = (events == -1) ? ngx_errno : 0;
+    if (timer == NGX_TIMER_INFINITE) {
+        struct __kernel_timespec ts;
+        ts.tv_sec = timer / 1000;
+        ts.tv_nsec = (timer - ts.tv_sec * 1000) * 1000;
+        ret = io_uring_wait_cqe_timeout(&ngx_ep_ring, &cqe, &ts);
+    } else {
+        ret = io_uring_wait_cqe(&ngx_ep_ring, &cqe);
+    }
+
+    err = (ret < 0) ? ngx_errno : 0;
 
     if (flags & NGX_UPDATE_TIME || ngx_event_timer_alarm) {
         ngx_time_update();
@@ -589,22 +450,30 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
             level = NGX_LOG_ALERT;
         }
 
-        ngx_log_error(level, cycle->log, err, "epoll_wait() failed");
+        ngx_log_error(level, cycle->log, err, "io_uring_wait_cqe() failed");
         return NGX_ERROR;
     }
 
-    if (events == 0) {
+    if (!cqe) {
         if (timer != NGX_TIMER_INFINITE) {
             return NGX_OK;
         }
 
         ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
-                      "epoll_wait() returned no events without timeout");
+                      "io_uring_wait_cqe() returned no events without timeout");
         return NGX_ERROR;
     }
 
-    for (i = 0; i < events; i++) {
-        c = event_list[i].data.ptr;
+    unsigned head;
+    unsigned cqe_count = 0;
+
+    io_uring_for_each_cqe(&ngx_ep_ring, head, cqe) {
+        ++cqe_count;
+        c = io_uring_cqe_get_data(cqe);
+        if (!c) {
+            /** POLL_REMOVE */
+            continue;
+        }
 
         instance = (uintptr_t) c & 1;
         c = (ngx_connection_t *) ((uintptr_t) c & (uintptr_t) ~1);
@@ -623,15 +492,15 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
             continue;
         }
 
-        revents = event_list[i].events;
+        revents = cqe->res;
 
         ngx_log_debug3(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
                        "epoll: fd:%d ev:%04XD d:%p",
-                       c->fd, revents, event_list[i].data.ptr);
+                       c->fd, revents, c);
 
         if (revents & (EPOLLERR|EPOLLHUP)) {
             ngx_log_debug2(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
-                           "epoll_wait() error on fd:%d ev:%04XD",
+                           "io_uring_wait_cqe() error on fd:%d ev:%04XD",
                            c->fd, revents);
 
             /*
@@ -652,11 +521,9 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
 
         if ((revents & EPOLLIN) && rev->active) {
 
-#if (NGX_HAVE_EPOLLRDHUP)
             if (revents & EPOLLRDHUP) {
                 rev->pending_eof = 1;
             }
-#endif
 
             rev->ready = 1;
             rev->available = -1;
@@ -701,6 +568,8 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
             }
         }
     }
+
+    io_uring_cq_advance(&ngx_ep_ring, cqe_count);
 
     return NGX_OK;
 }
@@ -757,7 +626,6 @@ ngx_epoll_create_conf(ngx_cycle_t *cycle)
         return NULL;
     }
 
-    epcf->events = NGX_CONF_UNSET;
     epcf->aio_requests = NGX_CONF_UNSET;
 
     return epcf;
@@ -769,7 +637,6 @@ ngx_epoll_init_conf(ngx_cycle_t *cycle, void *conf)
 {
     ngx_epoll_conf_t *epcf = conf;
 
-    ngx_conf_init_uint_value(epcf->events, 512);
     ngx_conf_init_uint_value(epcf->aio_requests, 32);
 
     return NGX_CONF_OK;
