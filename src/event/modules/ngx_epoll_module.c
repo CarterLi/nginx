@@ -192,6 +192,12 @@ ngx_epoll_add_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
                    "epoll add event: fd:%d op:%d ev:%08XD",
                    c->fd, op, ee.events);
 
+    if (io_uring_submit(&ngx_ring) < 0) {
+        ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_errno,
+                      "io_uring_submit(poll_add) failed");
+        return NGX_ERROR;
+    }
+
     ev->active = 1;
 #if 0
     ev->oneshot = (flags & NGX_ONESHOT_EVENT) ? 1 : 0;
@@ -254,6 +260,12 @@ ngx_epoll_del_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
                    "epoll del event: fd:%d op:%d ev:%08XD",
                    c->fd, op, ee.events);
 
+    if (io_uring_submit(&ngx_ring) < 0) {
+        ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_errno,
+                      "io_uring_submit(poll_remove) failed");
+        return NGX_ERROR;
+    }
+
     ev->active = 0;
 
     return NGX_OK;
@@ -275,6 +287,12 @@ ngx_epoll_add_connection(ngx_connection_t *c)
 
     ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
                    "epoll add connection: fd:%d ev:%08XD", c->fd, ee.events);
+
+    if (io_uring_submit(&ngx_ring) < 0) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, ngx_errno,
+                      "io_uring_submit(poll_add_conn) failed");
+        return NGX_ERROR;
+    }
 
     c->read->active = 1;
     c->write->active = 1;
@@ -309,6 +327,12 @@ ngx_epoll_del_connection(ngx_connection_t *c, ngx_uint_t flags)
     struct io_uring_sqe *sqe = ngx_get_sqe_safe(&ngx_ring, c->log);
     io_uring_prep_poll_remove(sqe, ee.data.ptr);
 
+    if (io_uring_submit(&ngx_ring) < 0) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, ngx_errno,
+                      "io_uring_submit(poll_remove_conn) failed");
+        return NGX_ERROR;
+    }
+
     c->read->active = 0;
     c->write->active = 0;
 
@@ -334,17 +358,17 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
     struct io_uring_cqe *cqe;
     int ret = 0;
 
-    if (timer == NGX_TIMER_INFINITE) {
-        struct __kernel_timespec ts;
-        ts.tv_sec = timer / 1000;
-        ts.tv_nsec = (timer - ts.tv_sec * 1000) * 1000;
-        ret = io_uring_submit(&ngx_ring);
+    if (timer != NGX_TIMER_INFINITE) {
+        struct __kernel_timespec ts = {
+            .tv_sec = timer / 1000,
+            .tv_nsec = (timer % 1000) * 1000000,
+        };
         ret = io_uring_wait_cqe_timeout(&ngx_ring, &cqe, &ts);
     } else {
-        ret = io_uring_submit_and_wait(&ngx_ring, 1);
+        ret = io_uring_wait_cqe(&ngx_ring, &cqe);
     }
 
-    err = (ret < 0) ? ngx_errno : 0;
+    err = (ret < 0 && ret != -ETIME) ? ngx_errno : 0;
 
     if (flags & NGX_UPDATE_TIME || ngx_event_timer_alarm) {
         ngx_time_update();
@@ -365,6 +389,16 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
         }
 
         ngx_log_error(level, cycle->log, err, "io_uring_wait_cqe() failed");
+        return NGX_ERROR;
+    }
+
+    if (!cqe) {
+        if (timer != NGX_TIMER_INFINITE) {
+            return NGX_OK;
+        }
+
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                      "io_uring_wait_cqe() returned no events without timeout");
         return NGX_ERROR;
     }
 
@@ -485,16 +519,6 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
                 }
             }
         }
-    }
-
-    if (!cqe_count) {
-        if (timer != NGX_TIMER_INFINITE) {
-            return NGX_OK;
-        }
-
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
-                      "io_uring_wait_cqe() returned no events without timeout");
-        return NGX_ERROR;
     }
 
     io_uring_cq_advance(&ngx_ring, cqe_count);
