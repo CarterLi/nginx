@@ -433,7 +433,7 @@ struct ngx_http_request_s {
 
 #if (NGX_PCRE)
     ngx_uint_t                        ncaptures;
-    int                              *captures;
+    pcre2_match_data                 *captures;
     u_char                           *captures_data;
 #endif
 
